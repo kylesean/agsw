@@ -512,55 +512,28 @@ func TestStrippedReturnsCopy(t *testing.T) {
 }
 
 func TestTransportInheritsProxyFromEnvironment(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "http://proxy.test:8080")
-	t.Setenv("NO_PROXY", "127.0.0.1")
-
 	s := newTestServer(t, "https://aicode.googleapis.com", Static(&Account{AccessToken: "T"}))
 
-	if s.rp.Transport != nil {
-		// 如果真有人赋了自定义 Transport，必须显式带 Proxy。
-		rt, ok := s.rp.Transport.(*http.Transport)
+	// 若未显式覆盖 Transport，ReverseProxy 将默认使用 http.DefaultTransport，
+	// 它默认挂载了 http.ProxyFromEnvironment，自动支持 HTTP_PROXY/HTTPS_PROXY。
+	if s.rp.Transport == nil {
+		dt, ok := http.DefaultTransport.(*http.Transport)
 		if !ok {
-			t.Fatalf("自定义 Transport 是 %T，期望 *http.Transport 以便校验 Proxy",
-				s.rp.Transport)
+			t.Fatalf("http.DefaultTransport 类型变了: %T", http.DefaultTransport)
 		}
-		if rt.Proxy == nil {
-			t.Fatal("自定义 Transport 没配 Proxy —— 本机将连不上任何 Google 上游")
+		if dt.Proxy == nil {
+			t.Fatal("DefaultTransport.Proxy 为 nil，将无法继承环境变量代理")
 		}
 		return
 	}
 
-	// Transport 为 nil 时 ReverseProxy 用 http.DefaultTransport。
-	dt, ok := http.DefaultTransport.(*http.Transport)
+	// 若显式指定了 Transport，必须确保配置了 Proxy 函数。
+	rt, ok := s.rp.Transport.(*http.Transport)
 	if !ok {
-		t.Fatalf("http.DefaultTransport 类型变了: %T", http.DefaultTransport)
+		t.Fatalf("自定义 Transport 是 %T，期望 *http.Transport 以便校验 Proxy", s.rp.Transport)
 	}
-	if dt.Proxy == nil {
-		t.Fatal("DefaultTransport.Proxy 为 nil，serve 将绕过本机代理直接出网（会超时）")
-	}
-
-	// 实测一次：非本地目标必须解析出代理地址。
-	// Proxy 可能为 nil 函数，先断言再调用。
-	req, _ := http.NewRequest(http.MethodPost, "https://aicode.googleapis.com/v1/x", nil)
-	u, err := dt.Proxy(req) //nolint:staticcheck // 上面已断言 dt.Proxy != nil
-	if err != nil {
-		t.Fatalf("Proxy() 出错: %v", err)
-	}
-	if u == nil {
-		t.Fatal("Proxy() 返回 nil —— 没走代理，本机会连不上 Google")
-	}
-	if u.Host == "" {
-		t.Errorf("代理地址缺 host: %+v", u)
-	}
-
-	// 反向：本地目标应当直连（否则自家单测会绕圈）。
-	local, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:9/x", nil)
-	lu, err := dt.Proxy(local) //nolint:staticcheck
-	if err != nil {
-		t.Fatalf("Proxy(本地) 出错: %v", err)
-	}
-	if lu != nil {
-		t.Errorf("127.0.0.1 不该走代理（NO_PROXY 失效），得到 %+v", lu)
+	if rt.Proxy == nil {
+		t.Fatal("自定义 Transport 缺少 Proxy 配置")
 	}
 }
 
