@@ -1,0 +1,7 @@
+bin/
+agsw
+dist/
+agsw-probe-*.jsonl
+*.test
+*.out
+.codegraph/
