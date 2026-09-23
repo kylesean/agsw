@@ -512,6 +512,9 @@ func TestStrippedReturnsCopy(t *testing.T) {
 }
 
 func TestTransportInheritsProxyFromEnvironment(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://proxy.test:8080")
+	t.Setenv("NO_PROXY", "127.0.0.1")
+
 	s := newTestServer(t, "https://aicode.googleapis.com", Static(&Account{AccessToken: "T"}))
 
 	if s.rp.Transport != nil {
