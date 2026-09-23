@@ -3,8 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
-	"text/tabwriter"
+	"strings"
 	"time"
 
 	"github.com/kylesean/agsw/internal/keyring"
@@ -96,8 +95,24 @@ func cmdList(args []string) error {
 		curEmail = email
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "名字\t邮箱\t过期时间\trefresh\t当前")
+	type row struct {
+		name    string
+		email   string
+		expiry  string
+		refresh string
+		current string
+	}
+
+	rows := []row{
+		{
+			name:    "名字",
+			email:   "邮箱",
+			expiry:  "过期时间",
+			refresh: "refresh",
+			current: "当前",
+		},
+	}
+
 	for _, a := range accounts {
 		refresh := "是"
 		if a.RefreshToken == "" {
@@ -107,10 +122,41 @@ func cmdList(args []string) error {
 		if a.Email == curEmail && curEmail != "" {
 			mark = "●"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			a.Name, a.Email, fmtExpiry(a.Expiry), refresh, mark)
+		rows = append(rows, row{
+			name:    a.Name,
+			email:   a.Email,
+			expiry:  fmtExpiry(a.Expiry),
+			refresh: refresh,
+			current: mark,
+		})
 	}
-	_ = w.Flush()
+
+	var wName, wEmail, wExpiry, wRefresh int
+	for _, r := range rows {
+		if w := visualWidth(r.name); w > wName {
+			wName = w
+		}
+		if w := visualWidth(r.email); w > wEmail {
+			wEmail = w
+		}
+		if w := visualWidth(r.expiry); w > wExpiry {
+			wExpiry = w
+		}
+		if w := visualWidth(r.refresh); w > wRefresh {
+			wRefresh = w
+		}
+	}
+
+	const colGap = 3
+	for _, r := range rows {
+		fmt.Printf("%s%s%s%s%s\n",
+			padRight(r.name, wName+colGap),
+			padRight(r.email, wEmail+colGap),
+			padRight(r.expiry, wExpiry+colGap),
+			padRight(r.refresh, wRefresh+colGap),
+			r.current,
+		)
+	}
 
 	if curEmail != "" {
 		fmt.Printf("\nkeyring 当前: %s\n", curEmail)
@@ -155,8 +201,8 @@ func cmdStatus(args []string) error {
 		if !a.CooldownUntil.IsZero() && time.Now().Before(a.CooldownUntil) {
 			extra = " [冷却中]"
 		}
-		fmt.Printf("  %-12s %s  过期 %s%s\n",
-			a.Name, a.Email, fmtExpiry(a.Expiry), extra)
+		fmt.Printf("  %s %s  过期 %s%s\n",
+			padRight(a.Name, 12), a.Email, fmtExpiry(a.Expiry), extra)
 	}
 	dir, _ := pool.Dir()
 	fmt.Printf("\n池目录: %s\n", dir)
@@ -206,4 +252,42 @@ func present(ok bool) string {
 		return "有"
 	}
 	return "无"
+}
+
+func runeWidth(r rune) int {
+	if r >= 0x20 && r <= 0x7e {
+		return 1
+	}
+	if r == '●' {
+		return 1
+	}
+	// CJK 表意字符、全角符号、韩文、日文假名及 Emoji 占用 2 个视觉列宽
+	if (r >= 0x1100 && r <= 0x115f) ||
+		(r >= 0x2e80 && r <= 0xa4cf) ||
+		(r >= 0xac00 && r <= 0xd7a3) ||
+		(r >= 0xf900 && r <= 0xfaff) ||
+		(r >= 0xfe10 && r <= 0xfe19) ||
+		(r >= 0xfe30 && r <= 0xfe6f) ||
+		(r >= 0xff00 && r <= 0xff60) ||
+		(r >= 0xffe0 && r <= 0xffe6) ||
+		(r >= 0x1f300 && r <= 0x1f9ff) {
+		return 2
+	}
+	return 1
+}
+
+func visualWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		w += runeWidth(r)
+	}
+	return w
+}
+
+func padRight(s string, width int) string {
+	vw := visualWidth(s)
+	if vw >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-vw)
 }
