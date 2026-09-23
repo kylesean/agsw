@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/kylesean/agsw)](https://github.com/kylesean/agsw/releases)
 
-**`agsw`** is an intelligent multi-account credential pool and reverse proxy gateway for Antigravity CLI ([`agy`](https://github.com/google-deepmind/antigravity-cli)).
+**`agsw`** is an intelligent multi-account credential pool and reverse proxy gateway for Antigravity CLI ([`agy`](https://antigravity.google/download)).
 
 It eliminates quota exhaustion interruptions by maintaining an isolated pool of Google accounts, continuously monitoring 5-hour and weekly quota sliding windows, and seamlessly rotating credentials on the fly.
 

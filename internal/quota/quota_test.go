@@ -248,7 +248,8 @@ func TestDescribe(t *testing.T) {
 	g := mustParse(t, realSummary).Gemini()
 	s := g.Describe()
 	t.Logf("摘要: %s", s)
-	for _, want := range []string{"5h", "0.00%", "周", "100.00%", "19:24"} {
+	wantTime := g.FiveHour.Reset().Local().Format("15:04")
+	for _, want := range []string{"5h", "0.00%", "周", "100.00%", wantTime} {
 		if !strings.Contains(s, want) {
 			t.Errorf("Describe()=%q 缺 %q", s, want)
 		}
