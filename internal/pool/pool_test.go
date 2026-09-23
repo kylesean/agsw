@@ -3,6 +3,7 @@ package pool
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -46,6 +47,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 }
 
 func TestPermissionsAre0600And0700(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 不支持 POSIX 文件权限位 (0700/0600)")
+	}
 	dir := withTmpDir(t)
 
 	if err := Save(&Account{Name: "a", Email: "a@example.com"}); err != nil {
@@ -72,6 +76,9 @@ func TestPermissionsAre0600And0700(t *testing.T) {
 }
 
 func TestSaveCreatesPrivateDirOnSecondWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 不支持 POSIX 文件权限位 (0700/0600)")
+	}
 	dir := withTmpDir(t)
 	if err := Save(&Account{Name: "one"}); err != nil {
 		t.Fatalf("Save: %v", err)
