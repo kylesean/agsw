@@ -1,5 +1,5 @@
 bin/
-agsw
+/agsw
 dist/
 agsw-probe-*.jsonl
 *.test
