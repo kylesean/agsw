@@ -616,3 +616,33 @@ func TestProxyReports429ToStatusReporter(t *testing.T) {
 	}
 }
 
+func TestProxyRetries429BeforeResponseOnNextAccount(t *testing.T) {
+	var gotTokens []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if string(body) != `{"prompt":"hello"}` {
+			t.Errorf("重试请求体 = %q", body)
+		}
+		token := r.Header.Get("Authorization")
+		gotTokens = append(gotTokens, token)
+		if len(gotTokens) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer up.Close()
+
+	picker := &rotatingPicker{tokens: []string{"A", "B"}}
+	s := newTestServer(t, up.URL, picker)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest("POST", "http://proxy.local/v1:predict", strings.NewReader(`{"prompt":"hello"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("最终状态码 = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(gotTokens) != 2 || gotTokens[0] != "Bearer A" || gotTokens[1] != "Bearer B" {
+		t.Fatalf("上游收到 token = %v, want [Bearer A Bearer B]", gotTokens)
+	}
+}

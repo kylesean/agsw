@@ -181,6 +181,73 @@ func List() ([]*Account, error) {
 	return out, nil
 }
 
+// normalizeEmail 统一邮箱大小写和首尾空白，避免同一账号因格式差异重复。
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+// FindByEmail 按规范化邮箱查找账号。找不到时返回 (nil, nil)，
+// 便于调用方把“没有重复”与池读取错误区分开。
+func FindByEmail(email string) (*Account, error) {
+	accounts, err := List()
+	if err != nil {
+		return nil, err
+	}
+	want := normalizeEmail(email)
+	if want == "" {
+		return nil, nil
+	}
+	for _, a := range accounts {
+		if normalizeEmail(a.Email) == want {
+			return a, nil
+		}
+	}
+	return nil, nil
+}
+
+// betterSameAccount 判断 candidate 是否比 current 更适合作为同邮箱账号的代表。
+// 优先保留可用且更新的凭据，最后按名称保证结果稳定。
+func betterSameAccount(candidate, current *Account) bool {
+	if (candidate.AccessToken != "") != (current.AccessToken != "") {
+		return candidate.AccessToken != ""
+	}
+	if !candidate.Expiry.Equal(current.Expiry) {
+		return candidate.Expiry.After(current.Expiry)
+	}
+	if (candidate.RefreshToken != "") != (current.RefreshToken != "") {
+		return candidate.RefreshToken != ""
+	}
+	if !candidate.AddedAt.Equal(current.AddedAt) {
+		return candidate.AddedAt.After(current.AddedAt)
+	}
+	return candidate.Name < current.Name
+}
+
+// Unique 按邮箱去重账号。邮箱为空时按名称保留独立记录；
+// 输出顺序按首次出现位置保持稳定。
+func Unique(accounts []*Account) []*Account {
+	positions := make(map[string]int, len(accounts))
+	out := make([]*Account, 0, len(accounts))
+	for _, a := range accounts {
+		if a == nil {
+			continue
+		}
+		key := normalizeEmail(a.Email)
+		if key == "" {
+			key = "\x00" + a.Name
+		}
+		if i, ok := positions[key]; ok {
+			if betterSameAccount(a, out[i]) {
+				out[i] = a
+			}
+			continue
+		}
+		positions[key] = len(out)
+		out = append(out, a)
+	}
+	return out
+}
+
 // Delete 移除单个账号。同样校验名字，绝不接受 .. 或斜杠。
 func Delete(name string) error {
 	path, err := filePath(name)

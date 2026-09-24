@@ -8,8 +8,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kylesean/agsw/internal/cloudcode"
@@ -44,13 +46,23 @@ const defaultUserAgent = "antigravity-cli/1.2.9"
 // cmdServe 启动反向代理服务。
 // 职责：挑选有效账号 → 注入 Authorization 与专用 User-Agent → 双向改写请求/响应信封
 // → 转发上游 → 后台监听配额并在耗尽或收到 429 时自动切号。
+type serveHooks struct {
+	onSwitch func(name, email string)
+}
+
+// cmdServe 保留原有 CLI 入口；gui 通过 cmdServeWithHooks 注入账号切换事件。
 func cmdServe(ctx context.Context, args []string) error {
+	return cmdServeWithHooks(ctx, args, serveHooks{})
+}
+
+func cmdServeWithHooks(ctx context.Context, args []string, hooks serveHooks) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := fs.String("listen", "127.0.0.1:7897", "监听地址")
 	upstream := fs.String("upstream", DefaultUpstream, "上游地址")
 	account := fs.String("account", "", "指定用池中哪个账号；留空则用池里全部，池空则回落 keyring 当前账号")
 	refresh := fs.Bool("refresh", false, "启动时先强制刷新一次 access_token")
 	verbose := fs.Bool("v", false, "打印每个请求的选号与转发结果")
+	logFile := fs.String("log-file", "", "日志文件；留空输出到 stderr")
 	ua := fs.String("user-agent", defaultUserAgent, "发给上游的 User-Agent（许可证闸门，一般别改）")
 	passthrough := fs.Bool("passthrough", false,
 		"关闭信封改写，纯透传（调试用；此时上游不会接受 agy 的 Gemini 路径）")
@@ -76,10 +88,19 @@ func cmdServe(ctx context.Context, args []string) error {
 		return fmt.Errorf("-quota-interval 不能为负（收到 %s）", *quotaInterval)
 	}
 
-	lg := log.New(os.Stderr, "[serve] ", log.LstdFlags|log.Lmsgprefix)
-	if !*verbose {
-		// 逐请求日志只在 -v 下开；否则 agy 每次重试都刷一行太吵。
-		lg.SetOutput(os.Stderr)
+	var lg *log.Logger
+	if strings.TrimSpace(*logFile) == "" {
+		lg = log.New(os.Stderr, "[serve] ", log.LstdFlags|log.Lmsgprefix)
+	} else {
+		if err := os.MkdirAll(filepath.Dir(*logFile), 0o700); err != nil {
+			return fmt.Errorf("创建日志目录失败: %w", err)
+		}
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return fmt.Errorf("打开日志文件失败: %w", err)
+		}
+		defer f.Close()
+		lg = log.New(f, "[serve] ", log.LstdFlags|log.Lmsgprefix)
 	}
 
 	cands, err := resolveCandidates(*account)
@@ -89,7 +110,7 @@ func cmdServe(ctx context.Context, args []string) error {
 
 	// 刷新逻辑交给 Selector，它在锁内做，防止并发请求触发刷新风暴。
 	sel := pool.NewSelector(cands, refreshAccount)
-	adapter := &selectorPicker{sel: sel, verbose: *verbose, log: lg}
+	adapter := &selectorPicker{sel: sel, verbose: *verbose, log: lg, onSwitch: hooks.onSwitch}
 
 	if *refresh {
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -139,8 +160,12 @@ func cmdServe(ctx context.Context, args []string) error {
 			lg.Printf("获取模型表失败，不做模型名映射（部分模型可能 404）: %v", aliasErr)
 		} else {
 			srv.SetModelAliases(models.Aliases)
-			lg.Printf("模型表 %d 个键，别名 %d 条：%s",
-				models.Keys, len(models.Aliases), formatAliases(models.Aliases))
+			if *verbose {
+				lg.Printf("模型表 %d 个键，别名 %d 条：%s",
+					models.Keys, len(models.Aliases), formatAliases(models.Aliases))
+			} else {
+				lg.Printf("模型映射已加载：%d 个别名", len(models.Aliases))
+			}
 			if models.DefaultAgentModelID != "" {
 				lg.Printf("上游默认模型 %s", models.DefaultAgentModelID)
 			}
@@ -153,7 +178,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	if n := len(cands); n > 1 {
 		lg.Printf("池中候选 %d 个：%s", n, joinNames(sel.Candidates()))
 	}
-	lg.Printf("接入: AGY_GATEWAY_URL=http://%s agy --print 'hi'", *listen)
+	lg.Printf("Gateway ready: %s", gatewayURL(*listen))
 
 	// 额度检测：启动先同步跑一轮，让第一个请求就已经知道哪些号没额度；
 	// 之后交给后台按 interval 轮询。首轮失败只告警，不拦启动 ——
@@ -164,6 +189,11 @@ func cmdServe(ctx context.Context, args []string) error {
 			qw.triggerCheck()
 		}
 		qw.check(ctx, true)
+		// 启动首轮额度检查可能已经冷却了 first；重新 Pick 一次，
+		// 让 gui 的 Keyring 同步拿到真正可用的账号。
+		if _, pickErr := sel.Pick(ctx); pickErr != nil {
+			lg.Printf("启动后重新选号失败: %v", pickErr)
+		}
 		go qw.run(ctx, *quotaInterval)
 		lg.Printf("额度检测 每 %s 查一次 GEMINI 组（阈值 %.3f）", *quotaInterval, *quotaThreshold)
 	} else {
@@ -199,10 +229,14 @@ func cmdServe(ctx context.Context, args []string) error {
 
 // selectorPicker 把 pool.Selector 适配成 proxy.Picker 与 proxy.StatusReporter。
 type selectorPicker struct {
-	sel     *pool.Selector
-	verbose bool
-	log     *log.Logger
-	on429   func(name string)
+	sel      *pool.Selector
+	verbose  bool
+	log      *log.Logger
+	on429    func(name string)
+	onSwitch func(name, email string)
+
+	mu       sync.Mutex
+	lastName string
 }
 
 func (p *selectorPicker) ReportStatus(name string, statusCode int) {
@@ -222,8 +256,15 @@ func (p *selectorPicker) Pick(ctx context.Context) (*proxy.Account, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.verbose && p.log != nil {
+	p.mu.Lock()
+	changed := a.Name != p.lastName
+	p.lastName = a.Name
+	p.mu.Unlock()
+	if p.log != nil && (p.verbose || changed) {
 		p.log.Printf("选号 %s (%s) 过期 %s", a.Name, a.Email, fmtExpiry(a.Expiry))
+	}
+	if changed && p.onSwitch != nil {
+		p.onSwitch(a.Name, a.Email)
 	}
 	return &proxy.Account{Name: a.Name, Email: a.Email, AccessToken: a.AccessToken}, nil
 }
@@ -244,6 +285,9 @@ func resolveCandidates(name string) ([]*pool.Account, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 池文件可能来自旧版本或人工复制；服务层再次按邮箱去重，
+	// 防止同一 Google 账号被重复轮换、重复刷新和重复查额度。
+	accounts = pool.Unique(accounts)
 	if len(accounts) > 0 {
 		return accounts, nil
 	}

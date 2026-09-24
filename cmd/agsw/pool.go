@@ -36,6 +36,13 @@ func cmdAdd(args []string) error {
 	if err != nil {
 		return fmt.Errorf("读取当前凭据失败: %w", err)
 	}
+	existing, err := pool.FindByEmail(email)
+	if err != nil {
+		return fmt.Errorf("检查邮箱是否已在账号池失败: %w", err)
+	}
+	if existing != nil {
+		return fmt.Errorf("邮箱 %s 已存在（账号 %s），请使用不同 Google 账号；如需替换请先 agsw drop %s", email, existing.Name, existing.Name)
+	}
 	claims, err := sec.Claims()
 	if err != nil {
 		return fmt.Errorf("解析身份失败: %w", err)
@@ -82,6 +89,8 @@ func cmdList(args []string) error {
 	if err != nil {
 		return err
 	}
+	// 展示有效候选，和 serve 使用相同规则；旧重复文件仍可通过 drop 清理。
+	accounts = pool.Unique(accounts)
 	if len(accounts) == 0 {
 		dir, _ := pool.Dir()
 		fmt.Printf("账号池为空（%s）\n", dir)
@@ -192,6 +201,8 @@ func cmdStatus(args []string) error {
 	if err != nil {
 		return err
 	}
+	// 状态展示同样隐藏旧池中的同邮箱重复文件。
+	accounts = pool.Unique(accounts)
 	if len(accounts) == 0 {
 		fmt.Println("  (空)")
 		return nil

@@ -1,6 +1,6 @@
 # agsw
 
-[English](README.md) | **中文文档**
+**中文文档** | [English](README.en.md)
 
 Antigravity CLI (`agy`) 多账号切换与反向代理管理工具。
 
@@ -60,7 +60,10 @@ agsw add      # 捕获当前系统 Keyring 中的凭据入池
 agsw list     # 列出账号池中的所有账号
 agsw status   # 查看当前系统 Keyring 账号与账号池状态
 agsw drop     # 从账号池中移除指定账号
-agsw serve    # 启动反向代理（凭据注入、信封改写与自动切号）
+agsw usage    # 查询账号池中各账号的真实额度
+agsw             # 推荐：直接启动 Gateway 并拉起 agy
+agsw gui         # 兼容别名：等价于 agsw
+agsw serve       # 仅启动反向代理
 ```
 
 ### 账号登录 (`login`)
@@ -98,6 +101,48 @@ agsw serve -v                 # 详细日志输出每次选号与转发详情
 agsw serve -quota-interval 1m # 配额轮询间隔（默认 1 分钟）
 ```
 
+### 统一启动 (`gui`)
+
+`gui` 是推荐入口：它会启动 Gateway，等待本地端口 ready，自动设置
+`AGY_GATEWAY_URL` 和 `NO_PROXY`，然后拉起 `agy`；`agy` 退出时自动关闭 Gateway。
+Gateway、额度轮询和账号切换日志默认写入 `~/.cache/agsw/gui.log`，不会插入 agy 的
+TUI 界面；可用 `tail -f ~/.cache/agsw/gui.log` 查看。
+
+交互式 `agy` 默认启用 `-sync-keyring`：实际选中的账号变化时，`gui` 会先把新账号
+凭据写入系统 Keyring，再只重启自己启动的 `agy`。重启后执行 `/resume` 恢复原会话，
+GUI 顶部账号会读取新的 Keyring 身份。agy 原生 `/usage` 是否经过 Gateway 取决于其自身实现，
+当前不保证由 agsw 代为代理；手动启动的 `agy` 不会被杀掉。
+
+```sh
+# 启动交互式 agy（推荐，最短用法）
+agsw
+
+# 等价写法：显式使用兼容别名
+agsw gui
+
+# 把 agy 参数放在 -- 后面；额度低于 0.2% 时提前切换
+agsw -quota-threshold=0.002 -- --dangerously-skip-permissions
+
+# 透传任意 agy 参数
+agsw -- --print 'hi'
+
+# 不修改系统 Keyring，也不自动重启
+agsw -sync-keyring=false
+```
+
+一次性 `agy --print` 不启用自动重启；它只通过 Gateway 发送请求。实际后端账号以
+`agsw` 的 `选号` 日志为准。agy 原生 `/usage` 是否经过 Gateway 取决于 agy 自身实现；
+需要查看真实账号池额度时，推荐直接运行：
+
+```sh
+agsw usage
+agsw usage -account B
+```
+
+上游返回 429 且响应尚未开始输出时，Gateway 会将当前账号短暂冷却，并用下一个账号
+重放一次请求。
+
+
 ### 额度检测与自动切号
 
 1. **只读端点感知**：
@@ -122,7 +167,7 @@ agsw add <name>
 - **本地存储安全**：账号池目录强制权限 `0700`，凭据文件强制权限 `0600`，写入采用临时文件原子替换。
 - **输入合法性校验**：账号名称强制校验白名单正则 `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`，严格禁止路径穿越。
 - **敏感信息脱敏**：探针与调试日志中对 `Authorization`、`Cookie` 等鉴权头执行脱敏掩码，避免 Token 泄露。
-- **只读 Keyring**：`add` 和 `status` 命令对系统 Secret Service 均为只读操作，不修改系统 Keyring。
+- **Keyring 写入受控**：`add` 和 `status` 仍只读；只有 `agsw gui` 管理交互式 `agy` 时，账号切换才会同步 Keyring 并重启它。可用 `-sync-keyring=false` 完全关闭写入。
 
 ## 风险声明
 

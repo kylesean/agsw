@@ -162,3 +162,34 @@ func TestServiceConstantsDocumentsTheContract(t *testing.T) {
 		t.Errorf("Username = %q, 想要 antigravity", Username)
 	}
 }
+
+func TestStoreSerializesSecretForAgyKeyring(t *testing.T) {
+	oldSet := setSecret
+	t.Cleanup(func() { setSecret = oldSet })
+	var gotService, gotUser, gotRaw string
+	setSecret = func(service, user, raw string) error {
+		gotService, gotUser, gotRaw = service, user, raw
+		return nil
+	}
+
+	sec := &Secret{
+		Token: Token{
+			AccessToken: "at", RefreshToken: "rt", TokenType: "Bearer",
+			Expiry: ExpiryTime{Time: time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)},
+		},
+		AuthMethod: "consumer", IDToken: "h.p.s",
+	}
+	if err := Store(sec); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if gotService != Service || gotUser != Username {
+		t.Fatalf("keyring location = %q/%q", gotService, gotUser)
+	}
+	got, err := Parse(gotRaw)
+	if err != nil {
+		t.Fatalf("stored JSON invalid: %v\n%s", err, gotRaw)
+	}
+	if got.Token.AccessToken != "at" || got.Token.RefreshToken != "rt" || got.IDToken != "h.p.s" {
+		t.Errorf("stored credentials = %+v", got)
+	}
+}

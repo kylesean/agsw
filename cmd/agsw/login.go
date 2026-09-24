@@ -51,6 +51,14 @@ func cmdLogin(ctx context.Context, args []string) error {
 		return err
 	}
 
+	existing, err := pool.FindByEmail(res.Email)
+	if err != nil {
+		return fmt.Errorf("登录成功但检查邮箱失败（凭据未保存）: %w", err)
+	}
+	if existing != nil {
+		return fmt.Errorf("邮箱 %s 已存在（账号 %s），请使用不同 Google 账号；如需替换请先 agsw drop %s", res.Email, existing.Name, existing.Name)
+	}
+
 	// 与 add 完全一致的池文件 schema，serve/pool/quota 零改动。
 	a := &pool.Account{
 		Name:         name,

@@ -389,6 +389,76 @@ func stripTopLevel(raw []byte, fields []string) ([]byte, error) {
 	return out, nil
 }
 
+// maxRetryBody 是允许为 429 重试缓存的最大请求体。超过它宁可不做透明重试，
+// 也不能为了重试把大请求全部留在内存里。
+const maxRetryBody = 8 << 20
+
+// retryResponseWriter 在收到 429 时暂存错误响应而不写给客户端；
+// 成功、4xx/5xx 以外的响应则立即透传，保留 SSE 的实时性。
+type retryResponseWriter struct {
+	dst       http.ResponseWriter
+	status    int
+	body      bytes.Buffer
+	suppress  bool
+	wroteHead bool
+}
+
+func (w *retryResponseWriter) Header() http.Header { return w.dst.Header() }
+
+func (w *retryResponseWriter) WriteHeader(code int) {
+	if w.wroteHead {
+		return
+	}
+	w.status = code
+	w.wroteHead = true
+	if code == http.StatusTooManyRequests {
+		w.suppress = true
+		return
+	}
+	w.dst.WriteHeader(code)
+}
+
+func (w *retryResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHead {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.suppress {
+		if w.body.Len() < maxErrBody {
+			_, _ = w.body.Write(p)
+		}
+		return len(p), nil
+	}
+	return w.dst.Write(p)
+}
+
+func (w *retryResponseWriter) Flush() {
+	if !w.suppress {
+		if f, ok := w.dst.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+}
+
+func retryRequestBody(r *http.Request) ([]byte, bool, error) {
+	if r.Body == nil || r.ContentLength < 0 || r.ContentLength > maxRetryBody {
+		return nil, false, nil
+	}
+	if r.Body == http.NoBody || r.ContentLength == 0 {
+		return nil, true, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRetryBody+1))
+	if err != nil {
+		// 读失败时不重试，把已经读出的部分放回去，交给原有转发路径处理。
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
+		return nil, false, nil
+	}
+	if len(body) > maxRetryBody {
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
+		return nil, false, nil
+	}
+	return body, true, nil
+}
+
 // ServeHTTP 改写请求体 → （信封改写）→ 选号 → 注入 → 转发。
 //
 // 改写必须在选号之前完成：它可能直接失败（body 不是 JSON），
@@ -418,14 +488,48 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	a, err := s.picker.Pick(r.Context())
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+	body, retryable, bodyErr := retryRequestBody(r)
+	if bodyErr != nil {
+		s.log.Printf("读取请求体失败 %s%s: %v", r.Host, r.URL.Path, bodyErr)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	ctx := context.WithValue(r.Context(), ctxAccount{}, a)
-	s.log.Printf("→ %s (%s) %s%s", a.Name, a.Email, r.Host, r.URL.RequestURI())
-	s.rp.ServeHTTP(w, r.WithContext(ctx))
+
+	for attempt := 0; ; attempt++ {
+		a, err := s.picker.Pick(r.Context())
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		ctx := context.WithValue(r.Context(), ctxAccount{}, a)
+
+		req := r.Clone(ctx)
+		if retryable {
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(body)), nil
+			}
+		}
+		s.log.Printf("→ %s (%s) %s%s", a.Name, a.Email, r.Host, r.URL.RequestURI())
+
+		if !retryable {
+			s.rp.ServeHTTP(w, req)
+			return
+		}
+
+		rw := &retryResponseWriter{dst: w}
+		s.rp.ServeHTTP(rw, req)
+		if rw.status != http.StatusTooManyRequests || attempt >= 1 {
+			if rw.status == http.StatusTooManyRequests {
+				w.WriteHeader(rw.status)
+				_, _ = w.Write(rw.body.Bytes())
+			}
+			return
+		}
+
+		s.log.Printf("上游 429，账号 %s 冷却，重试下一个账号", a.Name)
+	}
 }

@@ -8,6 +8,34 @@ import (
 	"time"
 )
 
+func TestFindByEmailNormalizesAndFindsExistingAccount(t *testing.T) {
+	withTmpDir(t)
+	if err := Save(&Account{Name: "work", Email: "User@Example.COM"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := FindByEmail(" user@example.com ")
+	if err != nil {
+		t.Fatalf("FindByEmail: %v", err)
+	}
+	if got.Name != "work" {
+		t.Fatalf("FindByEmail = %q, want work", got.Name)
+	}
+}
+
+func TestUniquePrefersFreshCredentialPerEmail(t *testing.T) {
+	old := &Account{Name: "old", Email: "User@Example.com", AccessToken: "OLD", Expiry: time.Now().Add(-time.Hour), AddedAt: time.Now().Add(-2 * time.Hour)}
+	fresh := &Account{Name: "fresh", Email: "user@example.com", AccessToken: "NEW", Expiry: time.Now().Add(time.Hour), AddedAt: time.Now()}
+	other := &Account{Name: "other", Email: "other@example.com", AccessToken: "OTHER", Expiry: time.Now().Add(time.Hour)}
+
+	got := Unique([]*Account{old, other, fresh})
+	if len(got) != 2 {
+		t.Fatalf("Unique returned %d accounts, want 2", len(got))
+	}
+	if got[0].Name != "fresh" || got[1].Name != "other" {
+		t.Fatalf("Unique selection/order = %q, %q; want fresh, other", got[0].Name, got[1].Name)
+	}
+}
+
 // withTmpDir 把池重定向到临时目录，绝不碰真实 ~/.local/share/agsw。
 func withTmpDir(t *testing.T) string {
 	t.Helper()

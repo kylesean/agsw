@@ -13,13 +13,15 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 )
 
 const usage = `agsw — agy 多账号切换器
 
 用法:
-  agsw <命令> [参数]
+  agsw                 直接启动 Gateway 并拉起 agy（推荐）
+  agsw <命令> [参数]  执行指定子命令
 
 命令:
   probe    启动拦截探针（观察线格式与协议交互）
@@ -28,18 +30,25 @@ const usage = `agsw — agy 多账号切换器
   list     列出账号池中的账号
   status   显示当前系统 Keyring 账号与账号池状态
   drop     从池中移除指定账号
+  usage    查询账号池中各账号的真实额度
   serve    启动反向代理（凭据注入、信封改写与自动切号）
+  gui      启动 Gateway 并自动拉起 agy（agsw 的兼容别名）
 
 各命令用 "<命令> -h" 查看参数。
 `
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+	cmd := "gui"
+	var args []string
+	if len(os.Args) >= 2 {
+		first := os.Args[1]
+		if strings.HasPrefix(first, "-") && first != "-h" && first != "--help" {
+			cmd = "gui"
+			args = os.Args[1:]
+		} else {
+			cmd, args = first, os.Args[2:]
+		}
 	}
-
-	cmd, args := os.Args[1], os.Args[2:]
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -58,8 +67,12 @@ func main() {
 		err = cmdStatus(args)
 	case "drop":
 		err = cmdDrop(args)
+	case "usage":
+		err = cmdUsage(args)
 	case "serve":
 		err = cmdServe(ctx, args)
+	case "gui":
+		err = cmdGUI(ctx, args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return

@@ -1,10 +1,7 @@
-// Package keyring 读取并解析 agy 保存在 Secret Service 中的 OAuth 凭据。
+// Package keyring 读取、解析并受控写入 agy 保存在 Secret Service 中的 OAuth 凭据。
 //
-// 定位键 service=gemini / username=antigravity 与 label 格式
-// "Password for '%s' on '%s'" 来自对 agy 二进制的逆向。
+// 读取路径供 status/add 使用；写入仅由 agsw gui 在确认需要重启 agy 时调用。
 // 本包使用 agy 同款库 zalando/go-keyring，保证与其字节级兼容。
-//
-// 本包只读，绝不写 keyring。
 package keyring
 
 import (
@@ -23,6 +20,25 @@ const (
 	Service  = "gemini"
 	Username = "antigravity"
 )
+
+// setSecret 可注入，测试不得写真实系统 Keyring。
+var setSecret = kr.Set
+
+// Store 将完整凭据写回 agy 使用的 Keyring 条目。
+// 调用方负责在写入后重启 agy，使进程重新读取凭据。
+func Store(sec *Secret) error {
+	if sec == nil {
+		return errors.New("凭据为 nil")
+	}
+	raw, err := json.Marshal(sec)
+	if err != nil {
+		return fmt.Errorf("序列化凭据失败: %w", err)
+	}
+	if err := setSecret(Service, Username, string(raw)); err != nil {
+		return fmt.Errorf("写入 keyring 失败: %w", err)
+	}
+	return nil
+}
 
 // ExpiryTime 兼容 RFC3339 字符串、Unix 秒数字面量、null 与缺失。
 type ExpiryTime struct{ time.Time }
