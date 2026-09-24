@@ -46,13 +46,23 @@ The communication protocols differ between `agy`'s gateway mode and native mode.
 
 ## Installation
 
-### Option 1: Via Go Toolchain (Recommended)
+### Option 1: One-Line Installer Script (Recommended)
+
+Run directly in your Linux or macOS terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kylesean/agsw/main/install.sh | sh
+```
+
+The script automatically detects your OS and architecture, downloads the latest release, verifies its SHA256 checksum, and places the executable into your `PATH`.
+
+### Option 2: Via Go Toolchain
 
 ```sh
 go install github.com/kylesean/agsw/cmd/agsw@latest
 ```
 
-### Option 2: Prebuilt Binaries
+### Option 3: Prebuilt Binaries
 
 Download precompiled archives for Linux, macOS, and Windows from [GitHub Releases](https://github.com/kylesean/agsw/releases). Extract the binary and place it in your `PATH`.
 

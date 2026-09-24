@@ -41,13 +41,23 @@ Antigravity CLI (`agy`) 多账号切换与反向代理管理工具。
 
 ## 安装方式
 
-### 方式 1：Go 工具链安装（推荐）
+### 方式 1：一键脚本安装（推荐）
+
+在 Linux / macOS 终端中直接执行：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kylesean/agsw/main/install.sh | sh
+```
+
+脚本会自动识别操作系统与架构、获取最新 Release、校验 SHA256 完整性并安装到系统的 `PATH` 路径中。
+
+### 方式 2：Go 工具链安装
 
 ```sh
 go install github.com/kylesean/agsw/cmd/agsw@latest
 ```
 
-### 方式 2：下载预编译二进制
+### 方式 3：下载预编译二进制
 
 从 [GitHub Releases](https://github.com/kylesean/agsw/releases) 下载适用于你的系统架构（Linux / macOS / Windows）的预编译包，解压后放入系统 `PATH` 目录即可。
 
