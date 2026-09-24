@@ -1,6 +1,9 @@
 package token
 
-import "sync"
+import (
+	"os"
+	"sync"
+)
 
 // endpointVar 让测试能把端点指到桩服务器。
 // 用变量而非改写 Endpoint 常量，保持生产路径是 const。
@@ -16,7 +19,11 @@ func setEndpoint(u string) {
 }
 
 func currentEndpoint() string {
+	if env := os.Getenv("AGSW_TOKEN_URL"); env != "" {
+		return env
+	}
 	endpointMu.RLock()
 	defer endpointMu.RUnlock()
 	return endpoint
 }
+

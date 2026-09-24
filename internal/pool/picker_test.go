@@ -492,4 +492,73 @@ func TestPickDeduplicatesConcurrentRefreshes(t *testing.T) {
 	}
 }
 
+func TestPickActiveAccountAffinity(t *testing.T) {
+	now := baseTime
+	timeFn := func() time.Time { return now }
+
+	a := &Account{Name: "A", AccessToken: "TA", Expiry: now.Add(time.Hour)}
+	b := &Account{Name: "B", AccessToken: "TB", Expiry: now.Add(time.Hour)}
+
+	s := NewSelector([]*Account{a, b}, noRefresh)
+	s.now = timeFn
+
+	got, err := s.Pick(context.Background())
+	if err != nil || got.Name != "A" {
+		t.Fatalf("首选应当是 A, got %v, err %v", got, err)
+	}
+
+	// A 冷却
+	s.SetCooldown("A", now.Add(30*time.Minute))
+
+	got, err = s.Pick(context.Background())
+	if err != nil || got.Name != "B" {
+		t.Fatalf("A 冷却后应当切换到 B, got %v, err %v", got, err)
+	}
+
+	// 时间前进 40 分钟，A 已经解冻，但 B 依然健康
+	now = now.Add(40 * time.Minute)
+
+	got, err = s.Pick(context.Background())
+	if err != nil || got.Name != "B" {
+		t.Fatalf("A 解冻后，活跃账号 B 仍健康时应保持粘性，预期 B，实际得到 %v", got.Name)
+	}
+}
+
+func TestFreshTokenRefreshesExpiredTokenEvenWhenCooling(t *testing.T) {
+	now := baseTime
+	timeFn := func() time.Time { return now }
+
+	var refreshCalls int
+	refresh := func(ctx context.Context, a *Account) error {
+		refreshCalls++
+		a.AccessToken = "NEW-TOKEN"
+		a.Expiry = now.Add(time.Hour)
+		return nil
+	}
+
+	a := &Account{
+		Name:         "A",
+		AccessToken:  "OLD-EXPIRED",
+		RefreshToken: "RT",
+		Expiry:       now.Add(-10 * time.Minute),
+	}
+	s := NewSelector([]*Account{a}, refresh)
+	s.now = timeFn
+
+	// 设置冷却，验证 FreshToken 不受冷却拦截
+	s.SetCooldown("A", now.Add(2*time.Hour))
+
+	tok, err := s.FreshToken(context.Background(), "A")
+	if err != nil {
+		t.Fatalf("FreshToken error: %v", err)
+	}
+	if tok != "NEW-TOKEN" {
+		t.Fatalf("tok = %q, want NEW-TOKEN", tok)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1", refreshCalls)
+	}
+}
+
+
 

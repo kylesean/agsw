@@ -59,11 +59,13 @@ func (q *quotaWatcher) triggerCheck() {
 func (q *quotaWatcher) check(ctx context.Context, first bool) {
 	now := time.Now()
 	for _, a := range q.sel.Candidates() {
-		if a.AccessToken == "" {
+		tok, err := q.sel.FreshToken(ctx, a.Name)
+		if err != nil {
+			q.log.Printf("查额度 %s 获取 token 失败（保持原状态）: %v", a.Name, err)
 			continue
 		}
 		ck, cancel := context.WithTimeout(ctx, 15*time.Second)
-		sum, err := quota.Fetch(ck, q.upstream, a.AccessToken, q.userAgent)
+		sum, err := quota.Fetch(ck, q.upstream, tok, q.userAgent)
 		cancel()
 		if err != nil {
 			q.log.Printf("查额度 %s 失败（保持原状态）: %v", a.Name, err)

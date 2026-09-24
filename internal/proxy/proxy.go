@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Account 是转发时要用的最小账号视图。
@@ -93,6 +94,7 @@ type Server struct {
 	// envelope 开启 Gemini REST ↔ CloudCode v1internal 双向改写。
 	envelope bool
 
+	aliasMu      sync.RWMutex
 	// modelAliases 是客户端请求模型名至上游实际模型标识的别名映射表。
 	modelAliases map[string]string
 
@@ -165,6 +167,7 @@ func New(rawUpstream string, picker Picker, lg *log.Logger) (*Server, error) {
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(b))
 			resp.ContentLength = int64(len(b))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(b)))
 			lg.Printf("上游 %d %s: %s",
 				resp.StatusCode, resp.Request.URL.Path, clipForLog(b, maxErrLog))
 			return nil
@@ -185,6 +188,8 @@ func (s *Server) SetUserAgent(ua string) { s.userAgent = ua }
 // SetModelAliases 设置「agy 的模型名 → 上游真实模型键」映射。
 // 传 nil 或空表表示不做映射。
 func (s *Server) SetModelAliases(m map[string]string) {
+	s.aliasMu.Lock()
+	defer s.aliasMu.Unlock()
 	if len(m) == 0 {
 		s.modelAliases = nil
 		return
@@ -197,6 +202,8 @@ func (s *Server) SetModelAliases(m map[string]string) {
 
 // ModelAliases 返回别名表副本，供启动日志展示。
 func (s *Server) ModelAliases() map[string]string {
+	s.aliasMu.RLock()
+	defer s.aliasMu.RUnlock()
 	if len(s.modelAliases) == 0 {
 		return nil
 	}
@@ -277,7 +284,9 @@ func (s *Server) applyEnvelope(r *http.Request) error {
 
 	// 模型名映射：agy 发的是它自己的叫法，上游的键可能带 -tiered 后缀。
 	// 漏了这一步，能通的请求会变成 404 NOT_FOUND。
+	s.aliasMu.RLock()
 	real, aliased := s.modelAliases[model]
+	s.aliasMu.RUnlock()
 	if aliased {
 		model = real
 	}
@@ -343,7 +352,7 @@ func (s *Server) unwrapResponse(resp *http.Response) error {
 			return fmt.Errorf("读取上游响应失败: %w", err)
 		}
 		if exceeded {
-			resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(b), resp.Body))
+			resp.Body = &multiReadCloser{Reader: io.MultiReader(bytes.NewReader(b), resp.Body), Closer: resp.Body}
 			return nil
 		}
 		discardClose(resp.Body)
@@ -397,13 +406,30 @@ const maxRetryBody = 8 << 20
 // 成功、4xx/5xx 以外的响应则立即透传，保留 SSE 的实时性。
 type retryResponseWriter struct {
 	dst       http.ResponseWriter
+	header    http.Header
 	status    int
 	body      bytes.Buffer
 	suppress  bool
 	wroteHead bool
 }
 
-func (w *retryResponseWriter) Header() http.Header { return w.dst.Header() }
+func newRetryResponseWriter(dst http.ResponseWriter) *retryResponseWriter {
+	return &retryResponseWriter{
+		dst:    dst,
+		header: make(http.Header),
+	}
+}
+
+func (w *retryResponseWriter) Header() http.Header { return w.header }
+
+func (w *retryResponseWriter) flushHeaders() {
+	dstH := w.dst.Header()
+	for k, vv := range w.header {
+		for _, v := range vv {
+			dstH.Add(k, v)
+		}
+	}
+}
 
 func (w *retryResponseWriter) WriteHeader(code int) {
 	if w.wroteHead {
@@ -415,6 +441,7 @@ func (w *retryResponseWriter) WriteHeader(code int) {
 		w.suppress = true
 		return
 	}
+	w.flushHeaders()
 	w.dst.WriteHeader(code)
 }
 
@@ -439,6 +466,11 @@ func (w *retryResponseWriter) Flush() {
 	}
 }
 
+type multiReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
 func retryRequestBody(r *http.Request) ([]byte, bool, error) {
 	if r.Body == nil || r.ContentLength < 0 || r.ContentLength > maxRetryBody {
 		return nil, false, nil
@@ -449,11 +481,11 @@ func retryRequestBody(r *http.Request) ([]byte, bool, error) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRetryBody+1))
 	if err != nil {
 		// 读失败时不重试，把已经读出的部分放回去，交给原有转发路径处理。
-		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
+		r.Body = &multiReadCloser{Reader: io.MultiReader(bytes.NewReader(body), r.Body), Closer: r.Body}
 		return nil, false, nil
 	}
 	if len(body) > maxRetryBody {
-		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
+		r.Body = &multiReadCloser{Reader: io.MultiReader(bytes.NewReader(body), r.Body), Closer: r.Body}
 		return nil, false, nil
 	}
 	return body, true, nil
@@ -520,10 +552,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		rw := &retryResponseWriter{dst: w}
+		rw := newRetryResponseWriter(w)
 		s.rp.ServeHTTP(rw, req)
 		if rw.status != http.StatusTooManyRequests || attempt >= 1 {
 			if rw.status == http.StatusTooManyRequests {
+				rw.header.Set("Content-Length", strconv.Itoa(rw.body.Len()))
+				rw.flushHeaders()
 				w.WriteHeader(rw.status)
 				_, _ = w.Write(rw.body.Bytes())
 			}

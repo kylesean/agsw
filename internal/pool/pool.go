@@ -36,10 +36,10 @@ type Account struct {
 	IDToken      string    `json:"id_token,omitempty"`
 	AuthMethod   string    `json:"auth_method,omitempty"`
 
-	// 额度与冷却状态
-	QuotaExhausted bool      `json:"quota_exhausted,omitempty"`
-	CooldownUntil  time.Time `json:"cooldown_until,omitempty"`
-	LastQuotaCheck time.Time `json:"last_quota_check,omitempty"`
+	// 额度与冷却状态（纯内存状态，不持久化至磁盘凭据文件）
+	QuotaExhausted bool      `json:"-"`
+	CooldownUntil  time.Time `json:"-"`
+	LastQuotaCheck time.Time `json:"-"`
 }
 
 // Dir 返回账号池目录。环境变量 AGSW_DATA_DIR 可覆盖，便于测试。
@@ -150,6 +150,23 @@ func Load(name string) (*Account, error) {
 	}
 	return &a, nil
 }
+
+// Exists 检查账号文件是否真实存在于池中。
+func Exists(name string) (bool, error) {
+	path, err := filePath(name)
+	if err != nil {
+		return false, err
+	}
+	_, err = os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
 
 // List 按名字排序返回全部账号。目录不存在时返回空切片而非报错。
 func List() ([]*Account, error) {

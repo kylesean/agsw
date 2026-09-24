@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestParseGeminiPath(t *testing.T) {
@@ -512,6 +515,53 @@ func TestSetModelAliasesCopiesInput(t *testing.T) {
 	}
 }
 
+func TestSetModelAliasesConcurrentSafety(t *testing.T) {
+	s := newTestServer(t, "http://127.0.0.1:1", Static(&Account{AccessToken: "T"}))
+	s.EnableEnvelope()
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					s.SetModelAliases(map[string]string{
+						"model-a": "model-a-tiered",
+						"model-b": "model-b-tiered",
+					})
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					_ = s.ModelAliases()
+					req, _ := http.NewRequest("POST", "http://gw/v1beta/models/model-a:generateContent", strings.NewReader(`{}`))
+					_ = s.applyEnvelope(req)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+
 func TestEnvelopeDefaultsToOff(t *testing.T) {
 	s := newTestServer(t, "http://127.0.0.1:1", Static(&Account{AccessToken: "T"}))
 	if s.Envelope() {
@@ -626,6 +676,26 @@ func TestUnwrapResponseJSONExceededPreservesReadableBody(t *testing.T) {
 	}
 	if len(got) != len(rawJSON) {
 		t.Fatalf("收到内容长度 %d, 预期 %d", len(got), len(rawJSON))
+	}
+}
+
+func TestUnwrapResponseJSONExceededClosesUnderlyingBody(t *testing.T) {
+	s := newEnvelopeServer(t, "http://127.0.0.1:1", Static(&Account{AccessToken: "T"}))
+	bigData := strings.Repeat("x", maxErrBody*16+1024)
+	tc := &trackingCloser{r: strings.NewReader(`{"huge":"` + bigData + `"}`)}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       tc,
+	}
+	if err := s.unwrapResponse(resp); err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !tc.closed {
+		t.Error("超限响应的底层 Body 未被关闭，存在连接泄漏")
 	}
 }
 

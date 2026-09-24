@@ -146,6 +146,7 @@ func cmdServeWithHooks(ctx context.Context, args []string, hooks serveHooks) err
 	if err != nil {
 		return err
 	}
+	adapter.setInitialAccount(first.Name, first.Email)
 
 	// 模型别名：agy 网关模式发的 gemini-3.8-flash 上游并不认，
 	// 真实键是 gemini-3.8-flash-tiered。拉一次模型表推导出来。
@@ -157,7 +158,8 @@ func cmdServeWithHooks(ctx context.Context, args []string, hooks serveHooks) err
 			first.AccessToken, srv.UserAgentForUpstream())
 		cancel()
 		if aliasErr != nil {
-			lg.Printf("获取模型表失败，不做模型名映射（部分模型可能 404）: %v", aliasErr)
+			lg.Printf("获取模型表失败，将在后台重试（当前部分模型可能 404）: %v", aliasErr)
+			go retryFetchModelAliases(ctx, sel, *upstream, srv, *verbose, lg, 10*time.Second)
 		} else {
 			srv.SetModelAliases(models.Aliases)
 			if *verbose {
@@ -191,8 +193,11 @@ func cmdServeWithHooks(ctx context.Context, args []string, hooks serveHooks) err
 		qw.check(ctx, true)
 		// 启动首轮额度检查可能已经冷却了 first；重新 Pick 一次，
 		// 让 gui 的 Keyring 同步拿到真正可用的账号。
-		if _, pickErr := sel.Pick(ctx); pickErr != nil {
+		if next, pickErr := sel.Pick(ctx); pickErr != nil {
 			lg.Printf("启动后重新选号失败: %v", pickErr)
+		} else if next.Name != first.Name {
+			first = next
+			adapter.setInitialAccount(first.Name, first.Email)
 		}
 		go qw.run(ctx, *quotaInterval)
 		lg.Printf("额度检测 每 %s 查一次 GEMINI 组（阈值 %.3f）", *quotaInterval, *quotaThreshold)
@@ -200,9 +205,15 @@ func cmdServeWithHooks(ctx context.Context, args []string, hooks serveHooks) err
 		lg.Printf("额度检测 已关闭（-quota-interval=0），不会自动换号")
 	}
 
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		adapter.beginRequest()
+		defer adapter.endRequest()
+		srv.ServeHTTP(w, r)
+	})
+
 	httpSrv := &http.Server{
 		Addr:              *listen,
-		Handler:           srv,
+		Handler:           handler,
 		ReadHeaderTimeout: 15 * time.Second,
 		// 不设 WriteTimeout / ReadTimeout：SSE 长流可能持续数分钟，
 		// 任何全局超时都会把它拦腰砍断。
@@ -227,6 +238,53 @@ func cmdServeWithHooks(ctx context.Context, args []string, hooks serveHooks) err
 	}
 }
 
+// retryFetchModelAliases 在后台周期性重试拉取模型表，直到成功或 ctx 取消。
+// 启动时若因临时网络抖动、DNS 故障失败，此协程可确保网络恢复后自动加载模型映射，
+// 避免整个 serve 生命周期内模型别名映射永久缺失导致 404。
+func retryFetchModelAliases(ctx context.Context, sel *pool.Selector, upstream string, srv *proxy.Server, verbose bool, lg *log.Logger, retryInterval time.Duration) {
+	if retryInterval <= 0 {
+		retryInterval = 10 * time.Second
+	}
+	ticker := time.NewTicker(retryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var tok string
+			for _, c := range sel.Candidates() {
+				if t, err := sel.FreshToken(ctx, c.Name); err == nil && t != "" {
+					tok = t
+					break
+				}
+			}
+			if tok == "" {
+				continue
+			}
+			fetchCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			models, err := cloudcode.FetchModels(fetchCtx, upstream, tok, srv.UserAgentForUpstream())
+			cancel()
+			if err != nil {
+				lg.Printf("后台重试获取模型表失败（将在 %s 后重试）: %v", retryInterval, err)
+				continue
+			}
+			srv.SetModelAliases(models.Aliases)
+			if verbose {
+				lg.Printf("后台重试获取模型表成功：模型表 %d 个键，别名 %d 条：%s",
+					models.Keys, len(models.Aliases), formatAliases(models.Aliases))
+			} else {
+				lg.Printf("后台重试获取模型表成功：已加载 %d 个别名", len(models.Aliases))
+			}
+			if models.DefaultAgentModelID != "" {
+				lg.Printf("上游默认模型 %s", models.DefaultAgentModelID)
+			}
+			return
+		}
+	}
+}
+
 // selectorPicker 把 pool.Selector 适配成 proxy.Picker 与 proxy.StatusReporter。
 type selectorPicker struct {
 	sel      *pool.Selector
@@ -235,8 +293,46 @@ type selectorPicker struct {
 	on429    func(name string)
 	onSwitch func(name, email string)
 
-	mu       sync.Mutex
-	lastName string
+	mu            sync.Mutex
+	lastName      string
+	inFlight      int
+	pendingSwitch *accountSwitch
+}
+
+func (p *selectorPicker) beginRequest() {
+	p.mu.Lock()
+	p.inFlight++
+	p.mu.Unlock()
+}
+
+func (p *selectorPicker) endRequest() {
+	var sw *accountSwitch
+	p.mu.Lock()
+	p.inFlight--
+	if p.inFlight <= 0 {
+		p.inFlight = 0
+		if p.pendingSwitch != nil {
+			sw = p.pendingSwitch
+			p.pendingSwitch = nil
+		}
+	}
+	p.mu.Unlock()
+
+	if sw != nil && p.onSwitch != nil {
+		if p.log != nil {
+			p.log.Printf("在飞请求全部完成，触发账号切换并同步: %s (%s)", sw.name, sw.email)
+		}
+		p.onSwitch(sw.name, sw.email)
+	}
+}
+
+func (p *selectorPicker) setInitialAccount(name, email string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastName = name
+	if p.onSwitch != nil {
+		p.onSwitch(name, email)
+	}
 }
 
 func (p *selectorPicker) ReportStatus(name string, statusCode int) {
@@ -259,11 +355,21 @@ func (p *selectorPicker) Pick(ctx context.Context) (*proxy.Account, error) {
 	p.mu.Lock()
 	changed := a.Name != p.lastName
 	p.lastName = a.Name
+	var immediateSwitch bool
+	if changed && p.onSwitch != nil {
+		if p.inFlight > 0 {
+			// 在飞请求处理中：暂存切换，等本次及并发请求平滑完成后再通知，绝不切断正在生成的流式回答
+			p.pendingSwitch = &accountSwitch{name: a.Name, email: a.Email}
+		} else {
+			immediateSwitch = true
+		}
+	}
 	p.mu.Unlock()
+
 	if p.log != nil && (p.verbose || changed) {
 		p.log.Printf("选号 %s (%s) 过期 %s", a.Name, a.Email, fmtExpiry(a.Expiry))
 	}
-	if changed && p.onSwitch != nil {
+	if immediateSwitch {
 		p.onSwitch(a.Name, a.Email)
 	}
 	return &proxy.Account{Name: a.Name, Email: a.Email, AccessToken: a.AccessToken}, nil
@@ -360,6 +466,11 @@ func refreshAccount(ctx context.Context, a *pool.Account) error {
 		a.RefreshToken = res.RefreshToken
 	}
 	if a.Name == "keyring" {
+		return nil
+	}
+	exists, err := pool.Exists(a.Name)
+	if err == nil && !exists {
+		// 账号已被外部删除（如 agsw drop），不再落盘复活
 		return nil
 	}
 	return pool.Save(a)

@@ -74,6 +74,40 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSaveDoesNotPersistCooldownOrQuotaState(t *testing.T) {
+	withTmpDir(t)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	ac := &Account{
+		Name:           "transient",
+		Email:          "transient@example.com",
+		AccessToken:    "at",
+		AddedAt:        now,
+		Expiry:         now.Add(time.Hour),
+		QuotaExhausted: true,
+		CooldownUntil:  now.Add(30 * time.Minute),
+		LastQuotaCheck: now,
+	}
+	if err := Save(ac); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	loaded, err := Load("transient")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.QuotaExhausted {
+		t.Error("QuotaExhausted 应为纯内存状态，不应持久化到磁盘")
+	}
+	if !loaded.CooldownUntil.IsZero() {
+		t.Errorf("CooldownUntil 应为纯内存状态，不应持久化到磁盘: %v", loaded.CooldownUntil)
+	}
+	if !loaded.LastQuotaCheck.IsZero() {
+		t.Errorf("LastQuotaCheck 应为纯内存状态，不应持久化到磁盘: %v", loaded.LastQuotaCheck)
+	}
+}
+
+
 func TestPermissionsAre0600And0700(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows 不支持 POSIX 文件权限位 (0700/0600)")

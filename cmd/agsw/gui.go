@@ -272,10 +272,9 @@ func cmdGUI(ctx context.Context, args []string) error {
 	defer cancel()
 	serverErr := make(chan error, 1)
 	go func() {
-		if err := cmdServeWithHooks(runCtx, serveArgs, hooks); err != nil {
-			serverErr <- err
-			cancel()
-		}
+		err := cmdServeWithHooks(runCtx, serveArgs, hooks)
+		serverErr <- err
+		cancel()
 	}()
 
 	gateway := gatewayURL(*listen)
@@ -313,10 +312,10 @@ func cmdGUI(ctx context.Context, args []string) error {
 			guiLog.Println("agy 已重启，请执行 /resume 恢复会话")
 		case err := <-agy.done:
 			cancel()
-			if runCtx.Err() != nil {
-				return nil
+			if err != nil && ctx.Err() == nil {
+				return fmt.Errorf("agy 退出: %w", err)
 			}
-			return fmt.Errorf("agy 退出: %w", err)
+			return nil
 		case err := <-serverErr:
 			stopAgy(agy, 5*time.Second)
 			cancel()

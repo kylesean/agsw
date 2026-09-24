@@ -23,8 +23,9 @@ type Selector struct {
 	cands    []*Account
 	refresh  Refresher
 	skew     time.Duration
-	now      func() time.Time
-	lastErrs error
+	now        func() time.Time
+	lastErrs   error
+	activeName string
 
 	accountMu sync.Mutex
 	locks     map[string]*sync.Mutex
@@ -80,7 +81,71 @@ func (s *Selector) LastErrors() error {
 	return s.lastErrs
 }
 
-// Pick 挑选可用账号快照。账号需要续期时在账号粒度进行并发同步，不阻塞全局锁。
+func (s *Selector) tryPick(ctx context.Context, a *Account, now time.Time) (*Account, error) {
+	if a == nil {
+		return nil, errors.New("账号为空")
+	}
+	if cooling(a, now) {
+		return nil, fmt.Errorf("%s: 冷却至 %s", a.Name, FormatCooldown(a.CooldownUntil))
+	}
+
+	l := s.accountLock(a.Name)
+
+	l.Lock()
+	needsRefresh := a.AccessToken == "" || withinSkew(a, now, s.skew)
+	l.Unlock()
+
+	if needsRefresh {
+		if s.refresh != nil && a.RefreshToken != "" {
+			s.mu.Unlock()
+
+			l.Lock()
+			now = s.now()
+			var err error
+			if a.AccessToken == "" || withinSkew(a, now, s.skew) {
+				err = s.refresh(ctx, a)
+			}
+			l.Unlock()
+
+			s.mu.Lock()
+			now = s.now()
+
+			// 重新加锁后再次检查冷却状态（可能在刷新期间被配额检测协程打上冷却）
+			if cooling(a, now) {
+				return nil, fmt.Errorf("%s: 冷却至 %s", a.Name, FormatCooldown(a.CooldownUntil))
+			}
+
+			if err != nil {
+				l.Lock()
+				expired := a.AccessToken == "" || hardExpired(a, now)
+				l.Unlock()
+				if expired {
+					return nil, fmt.Errorf("%s 刷新失败: %w", a.Name, err)
+				}
+			}
+		} else {
+			l.Lock()
+			expired := a.AccessToken == "" || hardExpired(a, now)
+			l.Unlock()
+			if expired {
+				return nil, fmt.Errorf("%s: 无可用 token 且无法刷新", a.Name)
+			}
+		}
+	}
+
+	l.Lock()
+	if a.AccessToken == "" {
+		l.Unlock()
+		return nil, fmt.Errorf("%s: access_token 为空", a.Name)
+	}
+	cp := *a
+	l.Unlock()
+
+	return &cp, nil
+}
+
+// Pick 挑选可用账号快照。具备活跃账号粘性（Active Account Affinity），
+// 账号需要续期时在账号粒度进行并发同步，不阻塞全局锁。
 func (s *Selector) Pick(ctx context.Context) (*Account, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -88,69 +153,37 @@ func (s *Selector) Pick(ctx context.Context) (*Account, error) {
 	now := s.now()
 	var errs []error
 
-	for i := 0; i < len(s.cands); i++ {
-		a := s.cands[i]
-		if a == nil {
-			continue
-		}
-		if cooling(a, now) {
-			errs = append(errs, fmt.Errorf("%s: 冷却至 %s",
-				a.Name, FormatCooldown(a.CooldownUntil)))
-			continue
-		}
-
-		l := s.accountLock(a.Name)
-
-		l.Lock()
-		needsRefresh := a.AccessToken == "" || withinSkew(a, now, s.skew)
-		l.Unlock()
-
-		if needsRefresh {
-			if s.refresh != nil && a.RefreshToken != "" {
-				s.mu.Unlock()
-
-				l.Lock()
-				now = s.now()
-				var err error
-				if a.AccessToken == "" || withinSkew(a, now, s.skew) {
-					err = s.refresh(ctx, a)
-				}
-				l.Unlock()
-
-				s.mu.Lock()
-				now = s.now()
-
-				if err != nil {
-					l.Lock()
-					expired := a.AccessToken == "" || hardExpired(a, now)
-					l.Unlock()
-					if expired {
-						errs = append(errs, fmt.Errorf("%s 刷新失败: %w", a.Name, err))
-						continue
-					}
-				}
-			} else {
-				l.Lock()
-				expired := a.AccessToken == "" || hardExpired(a, now)
-				l.Unlock()
-				if expired {
-					errs = append(errs, fmt.Errorf("%s: 无可用 token 且无法刷新", a.Name))
-					continue
-				}
+	// 1. 活跃账号粘性：优先沿用当前健康的活跃账号，避免旧账号解冻时反抢导致频繁切号
+	if s.activeName != "" {
+		var active *Account
+		for _, a := range s.cands {
+			if a != nil && a.Name == s.activeName {
+				active = a
+				break
 			}
 		}
+		if active != nil {
+			cp, err := s.tryPick(ctx, active, now)
+			if err == nil {
+				s.lastErrs = nil
+				return cp, nil
+			}
+			errs = append(errs, err)
+		}
+	}
 
-		l.Lock()
-		if a.AccessToken == "" {
-			l.Unlock()
-			errs = append(errs, fmt.Errorf("%s: access_token 为空", a.Name))
+	// 2. 活跃账号不可用（或初次选号）：按候选列表挑选首个可用健康账号
+	for _, a := range s.cands {
+		if a == nil || a.Name == s.activeName {
 			continue
 		}
-		cp := *a
-		l.Unlock()
-
-		s.lastErrs = nil
-		return &cp, nil
+		cp, err := s.tryPick(ctx, a, now)
+		if err == nil {
+			s.activeName = cp.Name
+			s.lastErrs = nil
+			return cp, nil
+		}
+		errs = append(errs, err)
 	}
 
 	s.lastErrs = errors.Join(errs...)
@@ -159,6 +192,7 @@ func (s *Selector) Pick(ctx context.Context) (*Account, error) {
 	}
 	return nil, fmt.Errorf("没有可用账号: %w", s.lastErrs)
 }
+
 
 // CooldownOf 返回账号当前的冷却截止时刻，账号不存在返回零值。只读，供日志展示。
 func (s *Selector) CooldownOf(name string) time.Time {
@@ -197,6 +231,42 @@ func (s *Selector) SetQuotaState(name string, exhausted bool) {
 		a.QuotaExhausted = exhausted
 		return
 	}
+}
+
+// FreshToken 返回指定账号的有效 access_token。若已过期或接近过期，会自动调用 refresh 续期。
+// 无论账号当前是否处于冷却状态，均可刷新（用于后台额度探测）。
+func (s *Selector) FreshToken(ctx context.Context, name string) (string, error) {
+	s.mu.Lock()
+	var target *Account
+	for _, a := range s.cands {
+		if a != nil && a.Name == name {
+			target = a
+			break
+		}
+	}
+	s.mu.Unlock()
+	if target == nil {
+		return "", fmt.Errorf("账号 %q 不在候选池中", name)
+	}
+
+	l := s.accountLock(target.Name)
+	l.Lock()
+	defer l.Unlock()
+
+	now := s.now()
+	needsRefresh := target.AccessToken == "" || withinSkew(target, now, s.skew)
+	if needsRefresh && s.refresh != nil && target.RefreshToken != "" {
+		if err := s.refresh(ctx, target); err != nil {
+			if target.AccessToken == "" || hardExpired(target, now) {
+				return "", fmt.Errorf("%s 刷新失败: %w", target.Name, err)
+			}
+		}
+	}
+
+	if target.AccessToken == "" {
+		return "", fmt.Errorf("%s: access_token 为空", target.Name)
+	}
+	return target.AccessToken, nil
 }
 
 // RefreshAll 强制刷新全部候选账号，常用于启动预热。

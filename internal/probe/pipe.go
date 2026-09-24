@@ -46,8 +46,15 @@ func pipe(ctx context.Context, a, b net.Conn) {
 	}
 	defer closeBoth()
 
+	var closeDone sync.Once
+	notifyDone := func() {
+		closeDone.Do(func() {
+			close(done)
+		})
+	}
+
 	go func() {
-		defer func() { close(done) }()
+		defer notifyDone()
 		_, _ = io.Copy(b, a)
 		// 半关闭，让对端收到 EOF。
 		if tc, ok := b.(*net.TCPConn); ok {
@@ -56,6 +63,7 @@ func pipe(ctx context.Context, a, b net.Conn) {
 	}()
 
 	go func() {
+		defer notifyDone()
 		_, _ = io.Copy(a, b)
 		if tc, ok := a.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()

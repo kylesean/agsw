@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -79,3 +80,16 @@ func TestSyncKeyringAccountUsesPoolCredentials(t *testing.T) {
 		t.Fatalf("stored secret = %+v", got)
 	}
 }
+
+func TestWaitGatewayReturnsErrorWhenServerExitsNilEarly(t *testing.T) {
+	serverErr := make(chan error, 1)
+	serverErr <- nil
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := waitGateway(ctx, "127.0.0.1:0", serverErr)
+	if err == nil || !strings.Contains(err.Error(), "serve 在 Gateway ready 前退出") {
+		t.Fatalf("err = %v, want error mentioning 'serve 在 Gateway ready 前退出'", err)
+	}
+}
+

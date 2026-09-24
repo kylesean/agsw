@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -646,3 +647,90 @@ func TestProxyRetries429BeforeResponseOnNextAccount(t *testing.T) {
 		t.Fatalf("上游收到 token = %v, want [Bearer A Bearer B]", gotTokens)
 	}
 }
+
+func TestProxyRetries429DoesNotLeakHeadersFromFailedAttempt(t *testing.T) {
+	attempts := 0
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Error-Reason", "quota_exhausted")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":"quota exceeded"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Success", "true")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"response\":{\"ok\":true}}\n\n")
+	}))
+	defer up.Close()
+
+	picker := &rotatingPicker{tokens: []string{"A", "B"}}
+	s := newTestServer(t, up.URL, picker)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest("POST", "http://proxy.local/v1:predict", strings.NewReader(`{"prompt":"hello"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, want 200", rec.Code)
+	}
+	if rec.Header().Get("X-Error-Reason") != "" {
+		t.Errorf("429 阶段的 Header 泄露到了最终 200 响应中: %s", rec.Header().Get("X-Error-Reason"))
+	}
+	if ct := rec.Header().Values("Content-Type"); len(ct) != 1 || ct[0] != "text/event-stream" {
+		t.Errorf("Content-Type 被污染或多重设置: %v, want [text/event-stream]", ct)
+	}
+	if cl := rec.Header().Get("Content-Length"); cl == "99" {
+		t.Errorf("429 的 Content-Length 泄露到了 200 响应中: %s", cl)
+	}
+}
+
+func TestModifyResponseLargeErrorBodyUpdatesContentLength(t *testing.T) {
+	largeErr := strings.Repeat("E", maxErrBody+1024)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Length", strconv.Itoa(len(largeErr)))
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, largeErr)
+	}))
+	defer up.Close()
+
+	s := newTestServer(t, up.URL, Static(&Account{AccessToken: "T"}))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest("GET", "http://proxy.local/v1/error", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500", rec.Code)
+	}
+	cl := rec.Header().Get("Content-Length")
+	if cl != strconv.Itoa(maxErrBody) {
+		t.Fatalf("Content-Length = %s, want %d", cl, maxErrBody)
+	}
+	if rec.Body.Len() != maxErrBody {
+		t.Fatalf("body length = %d, want %d", rec.Body.Len(), maxErrBody)
+	}
+}
+
+func TestProxyRetries429ExceededBodyMatchesContentLength(t *testing.T) {
+	largeErr := strings.Repeat("X", maxErrBody+2048)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(largeErr)))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, largeErr)
+	}))
+	defer up.Close()
+
+	s := newTestServer(t, up.URL, Static(&Account{AccessToken: "T"}))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest("POST", "http://proxy.local/v1/predict", strings.NewReader(`{}`)))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, want 429", rec.Code)
+	}
+	cl := rec.Header().Get("Content-Length")
+	if cl != strconv.Itoa(rec.Body.Len()) {
+		t.Fatalf("Content-Length header %s does not match body length %d", cl, rec.Body.Len())
+	}
+}
+

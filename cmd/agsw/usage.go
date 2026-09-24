@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/kylesean/agsw/internal/pool"
@@ -44,27 +45,41 @@ func cmdUsage(args []string) error {
 		return err
 	}
 	fmt.Println("账号\t邮箱\t额度")
-	var errs []error
-	for _, a := range accounts {
-		accountCtx, cancel := context.WithTimeout(context.Background(), *timeout)
-		needsRefresh := a.AccessToken == "" ||
-			(!a.Expiry.IsZero() && !time.Now().Before(a.Expiry.Add(-5*time.Minute)))
-		if needsRefresh && a.RefreshToken != "" {
-			if err := refreshAccount(accountCtx, a); err != nil {
-				cancel()
-				fmt.Println(formatUsageError(a, err))
-				errs = append(errs, err)
-				continue
+	var wg sync.WaitGroup
+	results := make([]string, len(accounts))
+	errs := make([]error, len(accounts))
+
+	for i, a := range accounts {
+		wg.Add(1)
+		go func(idx int, acc *pool.Account) {
+			defer wg.Done()
+			accountCtx, cancel := context.WithTimeout(context.Background(), *timeout)
+			defer cancel()
+
+			needsRefresh := acc.AccessToken == "" ||
+				(!acc.Expiry.IsZero() && !time.Now().Before(acc.Expiry.Add(-5*time.Minute)))
+			if needsRefresh && acc.RefreshToken != "" {
+				if err := refreshAccount(accountCtx, acc); err != nil {
+					results[idx] = formatUsageError(acc, err)
+					errs[idx] = err
+					return
+				}
 			}
+			sum, err := quota.Fetch(accountCtx, *upstream, acc.AccessToken, defaultUserAgent)
+			if err != nil {
+				results[idx] = formatUsageError(acc, err)
+				errs[idx] = err
+				return
+			}
+			results[idx] = formatUsageLine(acc, sum)
+		}(i, a)
+	}
+	wg.Wait()
+
+	for _, line := range results {
+		if line != "" {
+			fmt.Println(line)
 		}
-		sum, err := quota.Fetch(accountCtx, *upstream, a.AccessToken, defaultUserAgent)
-		cancel()
-		if err != nil {
-			fmt.Println(formatUsageError(a, err))
-			errs = append(errs, err)
-			continue
-		}
-		fmt.Println(formatUsageLine(a, sum))
 	}
 	return errors.Join(errs...)
 }

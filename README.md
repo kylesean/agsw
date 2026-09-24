@@ -61,9 +61,9 @@ agsw list     # 列出账号池中的所有账号
 agsw status   # 查看当前系统 Keyring 账号与账号池状态
 agsw drop     # 从账号池中移除指定账号
 agsw usage    # 查询账号池中各账号的真实额度
-agsw             # 推荐：直接启动 Gateway 并拉起 agy
-agsw gui         # 兼容别名：等价于 agsw
-agsw serve       # 仅启动反向代理
+agsw          # 推荐：直接启动 Gateway 并拉起 agy
+agsw gui      # 兼容别名：等价于 agsw
+agsw serve    # 仅启动反向代理
 ```
 
 ### 账号登录 (`login`)
